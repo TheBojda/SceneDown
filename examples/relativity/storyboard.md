@@ -30,8 +30,7 @@ tts:
     speed: 1.0
 
 alignment:
-  provider: whisperx
-  model: large-v3
+  provider: elevenlabs
 ---
 
 # Scene: Introduction
