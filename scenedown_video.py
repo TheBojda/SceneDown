@@ -35,7 +35,6 @@ def split_frontmatter(md: str):
 
 def parse_scene_images(md_body: str):
     scenes = []
-
     current = None
 
     for raw in md_body.splitlines():
@@ -46,6 +45,7 @@ def parse_scene_images(md_body: str):
                 "title": line.replace("# Scene:", "").strip(),
                 "image": None,
                 "animation": "slow-zoom",
+                "transition": "fade",
             }
             scenes.append(current)
             continue
@@ -67,7 +67,6 @@ def image_filter(animation, width, height, fps, frames):
     duration = frames / fps
     den = max(frames - 1, 1)
 
-    # Higher internal resolution = smoother subpixel-like motion
     work_scale = 4
     W = width * work_scale
     H = height * work_scale
@@ -129,6 +128,79 @@ def image_filter(animation, width, height, fps, frames):
     )
 
 
+def build_fade_video(clip_files, scene_durations, scenes, output_file, fps):
+    if len(clip_files) == 1:
+        run([
+            "ffmpeg", "-y",
+            "-i", str(clip_files[0]),
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            str(output_file),
+        ])
+        return
+
+    transition_duration = 1.0
+
+    inputs = []
+    for clip in clip_files:
+        inputs += ["-i", str(clip)]
+
+    filter_parts = []
+
+    cumulative_duration = scene_durations[0]
+    previous_stream = "[0:v]"
+
+    for i in range(1, len(clip_files)):
+        prev_scene = scenes[i - 1]
+        transition = prev_scene.get("transition", "fade")
+
+        if transition == "cut":
+            transition_duration_current = 0.0
+        else:
+            transition_duration_current = transition_duration
+
+        if transition_duration_current <= 0:
+            filter_parts.append(
+                f"{previous_stream}[{i}:v]"
+                f"concat=n=2:v=1:a=0"
+                f"[v{i}]"
+            )
+
+            previous_stream = f"[v{i}]"
+            cumulative_duration += scene_durations[i]
+            continue
+
+        offset = cumulative_duration - transition_duration_current
+
+        filter_parts.append(
+            f"{previous_stream}[{i}:v]"
+            f"xfade=transition=fade:"
+            f"duration={transition_duration_current}:"
+            f"offset={offset}"
+            f"[v{i}]"
+        )
+
+        previous_stream = f"[v{i}]"
+        cumulative_duration += scene_durations[i] - transition_duration_current
+
+    filter_complex = ";".join(filter_parts)
+
+    run([
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", previous_stream,
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", "slow",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        str(output_file),
+    ])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory")
@@ -158,6 +230,7 @@ def main():
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     clip_files = []
+    scene_durations = []
 
     for i, scene in enumerate(storyboard_scenes):
         image_file = base_dir / scene["image"]
@@ -173,9 +246,11 @@ def main():
             end = audio_duration
 
         duration = max(0.1, end - start)
+        scene_durations.append(duration)
+
         frames = math.ceil(duration * fps)
 
-        clip_file = clips_dir / f"scene_{i+1:03}.mp4"
+        clip_file = clips_dir / f"scene_{i + 1:03}.mp4"
         clip_files.append(clip_file)
 
         vf = image_filter(
@@ -201,24 +276,16 @@ def main():
             str(clip_file),
         ])
 
-    concat_file = clips_dir / "concat.txt"
-    concat_file.write_text(
-        "\n".join(f"file '{p.resolve()}'" for p in clip_files) + "\n",
-        encoding="utf-8",
-    )
-
     silent_video = output_dir / "video_silent.mp4"
     final_video = output_dir / "video.mp4"
 
-    run([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_file),
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        str(silent_video),
-    ])
+    build_fade_video(
+        clip_files=clip_files,
+        scene_durations=scene_durations,
+        scenes=storyboard_scenes,
+        output_file=silent_video,
+        fps=fps,
+    )
 
     run([
         "ffmpeg", "-y",
