@@ -72,7 +72,7 @@ def image_filter(animation, width, height, fps, frames):
     H = height * work_scale
 
     if animation == "slow-zoom":
-        zoom_amount = 0.06
+        zoom_amount = 0.04
 
         return (
             f"scale={W}:{H}:force_original_aspect_ratio=increase,"
@@ -90,36 +90,35 @@ def image_filter(animation, width, height, fps, frames):
             f"format=yuv420p"
         )
 
-    zoom = 1.12
+    zoom = 1.02
     sw = int(W * zoom)
     sh = int(H * zoom)
 
     t = f"n/{den}"
 
     if animation == "slow-pan-right":
-        x = f"({sw}-{W})*{t}"
-        y = f"({sh}-{H})/2"
+        x = f"floor(({sw}-{W})*{t})"
+        y = f"floor(({sh}-{H})/2)"
 
     elif animation == "slow-pan-left":
-        x = f"({sw}-{W})*(1-{t})"
-        y = f"({sh}-{H})/2"
+        x = f"floor(({sw}-{W})*(1-{t}))"
+        y = f"floor(({sh}-{H})/2)"
 
     elif animation == "slow-pan-up":
-        x = f"({sw}-{W})/2"
-        y = f"({sh}-{H})*(1-{t})"
+        x = f"floor(({sw}-{W})/2)"
+        y = f"floor(({sh}-{H})*(1-{t}))"
 
     elif animation == "slow-pan-down":
-        x = f"({sw}-{W})/2"
-        y = f"({sh}-{H})*{t}"
+        x = f"floor(({sw}-{W})/2)"
+        y = f"floor(({sh}-{H})*{t})"
 
     else:
-        x = f"({sw}-{W})/2"
-        y = f"({sh}-{H})/2"
+        x = f"floor(({sw}-{W})/2)"
+        y = f"floor(({sh}-{H})/2)"
 
     return (
         f"fps={fps},"
         f"scale={sw}:{sh}:force_original_aspect_ratio=increase,"
-        f"crop={sw}:{sh},"
         f"crop={W}:{H}:x='{x}':y='{y}',"
         f"scale={width}:{height}:flags=lanczos,"
         f"trim=duration={duration},"
@@ -129,81 +128,72 @@ def image_filter(animation, width, height, fps, frames):
 
 
 def build_fade_video(clip_files, scene_durations, scenes, output_file, fps):
+    if not clip_files:
+        return
+
     if len(clip_files) == 1:
         run([
             "ffmpeg", "-y",
             "-i", str(clip_files[0]),
-            "-c:v", "libx264",
-            "-preset", "slow",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            str(output_file),
+            "-c", "copy",
+            str(output_file)
         ])
         return
 
-    transition_duration = 1.0
-
-    inputs = []
-    for clip in clip_files:
-        inputs += ["-i", str(clip)]
-
     filter_parts = []
+    inputs = []
 
-    cumulative_duration = scene_durations[0]
+    for f in clip_files:
+        inputs.extend(["-i", str(f)])
+
     previous_stream = "[0:v]"
+    current_timeline_end = scene_durations[0]
 
     for i in range(1, len(clip_files)):
         prev_scene = scenes[i - 1]
         transition = prev_scene.get("transition", "fade")
 
         if transition == "cut":
-            transition_duration_current = 0.0
+            filter_parts.append(
+                f"{previous_stream}[{i}:v]concat=n=2:v=1:a=0[v{i}]"
+            )
+            current_timeline_end += scene_durations[i]
         else:
-            transition_duration_current = transition_duration
-
-        if transition_duration_current <= 0:
+            offset = current_timeline_end
             filter_parts.append(
                 f"{previous_stream}[{i}:v]"
-                f"concat=n=2:v=1:a=0"
+                f"xfade=transition=fade:"
+                f"duration=1.0:"
+                f"offset={offset}"
                 f"[v{i}]"
             )
-
-            previous_stream = f"[v{i}]"
-            cumulative_duration += scene_durations[i]
-            continue
-
-        offset = cumulative_duration - transition_duration_current
-
-        filter_parts.append(
-            f"{previous_stream}[{i}:v]"
-            f"xfade=transition=fade:"
-            f"duration={transition_duration_current}:"
-            f"offset={offset}"
-            f"[v{i}]"
-        )
+            current_timeline_end += scene_durations[i]
 
         previous_stream = f"[v{i}]"
-        cumulative_duration += scene_durations[i] - transition_duration_current
 
-    filter_complex = ";".join(filter_parts)
+    filter_script = ";".join(filter_parts)
 
-    run([
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", previous_stream,
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", filter_script,
+        "-map", f"[v{len(clip_files) - 1}]",
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "18",
         "-pix_fmt", "yuv420p",
-        str(output_file),
-    ])
+        str(output_file)
+    ]
+
+    run(cmd)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory")
+    parser.add_argument(
+        "--scene",
+        type=int,
+        help="Render only a single scene number, 1-based. Useful for debugging."
+    )
+
     args = parser.parse_args()
 
     base_dir = Path(args.directory).resolve()
@@ -218,6 +208,19 @@ def main():
     storyboard_scenes = parse_scene_images(body)
     aligned_scenes = json.loads(scenes_file.read_text(encoding="utf-8"))
 
+    if len(storyboard_scenes) != len(aligned_scenes):
+        raise RuntimeError(
+            f"Scene count mismatch: storyboard has {len(storyboard_scenes)}, "
+            f"alignment has {len(aligned_scenes)}"
+        )
+
+    if args.scene is not None:
+        if args.scene < 1 or args.scene > len(storyboard_scenes):
+            raise RuntimeError(
+                f"Invalid scene number: {args.scene}. "
+                f"Valid range: 1..{len(storyboard_scenes)}"
+            )
+
     video_meta = meta.get("video", {})
     width = int(video_meta.get("width", 1920))
     height = int(video_meta.get("height", 1080))
@@ -227,12 +230,22 @@ def main():
 
     output_dir = base_dir / "generated" / "video"
     clips_dir = output_dir / "clips"
+    output_dir.mkdir(parents=True, exist_ok=True)
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     clip_files = []
     scene_durations = []
+    selected_scenes = []
 
     for i, scene in enumerate(storyboard_scenes):
+        scene_number = i + 1
+
+        if args.scene is not None and scene_number != args.scene:
+            continue
+
+        if not scene.get("image"):
+            raise RuntimeError(f"Scene {scene_number} has no image")
+
         image_file = base_dir / scene["image"]
 
         if not image_file.exists():
@@ -247,10 +260,15 @@ def main():
 
         duration = max(0.1, end - start)
         scene_durations.append(duration)
+        selected_scenes.append(scene)
 
         frames = math.ceil(duration * fps)
 
-        clip_file = clips_dir / f"scene_{i + 1:03}.mp4"
+        if args.scene is not None:
+            clip_file = clips_dir / f"scene_debug_{scene_number:03}.mp4"
+        else:
+            clip_file = clips_dir / f"scene_{scene_number:03}.mp4"
+
         clip_files.append(clip_file)
 
         vf = image_filter(
@@ -276,13 +294,31 @@ def main():
             str(clip_file),
         ])
 
+    if not clip_files:
+        raise RuntimeError("No clips were generated")
+
+    if args.scene is not None:
+        final_video = output_dir / f"scene_debug_{args.scene:03}.mp4"
+
+        run([
+            "ffmpeg", "-y",
+            "-i", str(clip_files[0]),
+            "-c", "copy",
+            str(final_video),
+        ])
+
+        print(f"Generated debug scene video: {final_video}")
+        print(f"Scene number: {args.scene}")
+        print(f"Scene duration: {scene_durations[0]:.2f}s")
+        return
+
     silent_video = output_dir / "video_silent.mp4"
     final_video = output_dir / "video.mp4"
 
     build_fade_video(
         clip_files=clip_files,
         scene_durations=scene_durations,
-        scenes=storyboard_scenes,
+        scenes=selected_scenes,
         output_file=silent_video,
         fps=fps,
     )
