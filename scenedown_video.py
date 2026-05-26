@@ -127,7 +127,7 @@ def image_filter(animation, width, height, fps, frames):
     )
 
 
-def build_fade_video(clip_files, scene_durations, scenes, output_file, fps):
+def build_fade_video(clip_files, clip_durations, scenes, output_file, fps):
     if not clip_files:
         return
 
@@ -140,42 +140,49 @@ def build_fade_video(clip_files, scene_durations, scenes, output_file, fps):
         ])
         return
 
-    filter_parts = []
-    inputs = []
+    fade_duration = 1.0
 
+    inputs = []
     for f in clip_files:
         inputs.extend(["-i", str(f)])
 
-    previous_stream = "[0:v]"
-    current_timeline_end = scene_durations[0]
+    filter_parts = []
+
+    for i in range(len(clip_files)):
+        filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
+
+    previous_stream = "[v0]"
+    current_duration = clip_durations[0]
 
     for i in range(1, len(clip_files)):
-        prev_scene = scenes[i - 1]
-        transition = prev_scene.get("transition", "fade")
+        previous_scene = scenes[i - 1]
+        transition = previous_scene.get("transition", "fade")
 
         if transition == "cut":
             filter_parts.append(
-                f"{previous_stream}[{i}:v]concat=n=2:v=1:a=0[v{i}]"
+                f"{previous_stream}[v{i}]concat=n=2:v=1:a=0[out{i}]"
             )
-            current_timeline_end += scene_durations[i]
+            current_duration += clip_durations[i]
         else:
-            offset = current_timeline_end
-            filter_parts.append(
-                f"{previous_stream}[{i}:v]"
-                f"xfade=transition=fade:"
-                f"duration=1.0:"
-                f"offset={offset}"
-                f"[v{i}]"
-            )
-            current_timeline_end += scene_durations[i]
+            offset = max(0, current_duration - fade_duration)
 
-        previous_stream = f"[v{i}]"
+            filter_parts.append(
+                f"{previous_stream}[v{i}]"
+                f"xfade=transition=fade:"
+                f"duration={fade_duration}:"
+                f"offset={offset}"
+                f"[out{i}]"
+            )
+
+            current_duration += clip_durations[i] - fade_duration
+
+        previous_stream = f"[out{i}]"
 
     filter_script = ";".join(filter_parts)
 
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_script,
-        "-map", f"[v{len(clip_files) - 1}]",
+        "-map", previous_stream,
         "-r", str(fps),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
@@ -192,6 +199,11 @@ def main():
         "--scene",
         type=int,
         help="Render only a single scene number, 1-based. Useful for debugging."
+    )
+    parser.add_argument(
+        "--reuse-clips",
+        action="store_true",
+        help="Reuse already generated clips and skip clip rendering."
     )
 
     args = parser.parse_args()
@@ -234,8 +246,10 @@ def main():
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     clip_files = []
-    scene_durations = []
+    clip_durations = []
     selected_scenes = []
+
+    fade_duration = 1.0
 
     for i, scene in enumerate(storyboard_scenes):
         scene_number = i + 1
@@ -258,11 +272,20 @@ def main():
         else:
             end = audio_duration
 
-        duration = max(0.1, end - start)
-        scene_durations.append(duration)
+        real_duration = max(0.1, end - start)
+
+        transition = scene.get("transition", "fade")
+        is_last_scene = i == len(storyboard_scenes) - 1
+
+        render_duration = real_duration
+
+        if transition != "cut" and not is_last_scene:
+            render_duration += fade_duration
+
+        clip_durations.append(render_duration)
         selected_scenes.append(scene)
 
-        frames = math.ceil(duration * fps)
+        frames = math.ceil(render_duration * fps)
 
         if args.scene is not None:
             clip_file = clips_dir / f"scene_debug_{scene_number:03}.mp4"
@@ -271,28 +294,38 @@ def main():
 
         clip_files.append(clip_file)
 
-        vf = image_filter(
-            scene.get("animation", "slow-zoom"),
-            width,
-            height,
-            fps,
-            frames,
-        )
+        if args.reuse_clips and clip_file.exists():
+            print(f"Reusing existing clip: {clip_file}")
+        else:
+            vf = image_filter(
+                scene.get("animation", "slow-zoom"),
+                width,
+                height,
+                fps,
+                frames,
+            )
 
-        run([
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-i", str(image_file),
-            "-vf", vf,
-            "-t", str(duration),
-            "-r", str(fps),
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "slow",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            str(clip_file),
-        ])
+            run([
+                "ffmpeg", "-y",
+                "-loop", "1",
+                "-i", str(image_file),
+                "-vf", vf,
+                "-t", str(render_duration),
+                "-r", str(fps),
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "slow",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                str(clip_file),
+            ])
+
+        print(
+            f"Scene {scene_number:03}: "
+            f"real={real_duration:.2f}s "
+            f"render={render_duration:.2f}s "
+            f"transition={transition}"
+        )
 
     if not clip_files:
         raise RuntimeError("No clips were generated")
@@ -309,7 +342,7 @@ def main():
 
         print(f"Generated debug scene video: {final_video}")
         print(f"Scene number: {args.scene}")
-        print(f"Scene duration: {scene_durations[0]:.2f}s")
+        print(f"Scene duration: {clip_durations[0]:.2f}s")
         return
 
     silent_video = output_dir / "video_silent.mp4"
@@ -317,7 +350,7 @@ def main():
 
     build_fade_video(
         clip_files=clip_files,
-        scene_durations=scene_durations,
+        clip_durations=clip_durations,
         scenes=selected_scenes,
         output_file=silent_video,
         fps=fps,
@@ -333,8 +366,13 @@ def main():
         str(final_video),
     ])
 
+    silent_duration = ffprobe_duration(silent_video)
+    final_duration = ffprobe_duration(final_video)
+
     print(f"Generated video: {final_video}")
     print(f"Audio duration:  {audio_duration:.2f}s")
+    print(f"Silent duration: {silent_duration:.2f}s")
+    print(f"Final duration:  {final_duration:.2f}s")
 
 
 if __name__ == "__main__":
