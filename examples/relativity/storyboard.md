@@ -15,19 +15,35 @@ video:
 tts:
   provider: elevenlabs
   model_id: eleven_multilingual_v2
+  seed: 42
+
   voice_id: "CwhRBWXzGAHq8TQ4Fs17"
 
   style_prompt: >
-    Calm, intelligent, documentary-style narration.
-    Speak clearly and slightly dramatically,
-    like a science documentary narrator.
+    Calm, intelligent, cinematic documentary narration.
+    Speak slowly and clearly with a reflective, philosophical tone.
+    Slightly dramatic, but emotionally controlled.
+    The narration should feel like a high-quality science documentary
+    about reality, consciousness, physics, and the future of humanity.
+    Use natural pauses between important ideas.
+    Inspire curiosity, mystery, and wonder.
 
   voice_settings:
-    stability: 0.55
-    similarity_boost: 0.8
-    style: 0.25
+    stability: 0.58
+    similarity_boost: 0.78
+    style: 0.32
     use_speaker_boost: true
-    speed: 1.0
+    speed: 0.92
+
+  chunking:
+    max_chars: 9000
+    context_chars: 1200
+
+  post_processing:
+    target_lufs: -16
+    true_peak: -1.5
+    lra: 11
+    bitrate: 192k
 
 alignment:
   provider: elevenlabs

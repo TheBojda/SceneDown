@@ -11,9 +11,6 @@ import requests
 import yaml
 
 
-MAX_CHARS = 9000
-
-
 def split_frontmatter(md: str):
     if md.startswith("---"):
         parts = md.split("---", 2)
@@ -51,30 +48,36 @@ def extract_narration(md_body: str) -> str:
     return text.strip() + "\n"
 
 
-def split_text(text: str, max_chars: int = MAX_CHARS):
-    paragraphs = text.split("\n\n")
+def split_into_sentences(text: str):
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        return []
+
+    return re.split(r"(?<=[.!?])\s+", text)
+
+
+def split_text(text: str, max_chars: int):
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
     chunks = []
     current = ""
 
     for paragraph in paragraphs:
-        paragraph = paragraph.strip()
+        sentences = split_into_sentences(paragraph)
 
-        if not paragraph:
-            continue
+        for sentence in sentences:
+            candidate = f"{current} {sentence}".strip() if current else sentence
 
-        candidate = current + "\n\n" + paragraph if current else paragraph
-
-        if len(candidate) > max_chars:
-            if current:
-                chunks.append(current.strip())
-                current = paragraph
+            if len(candidate) > max_chars:
+                if current:
+                    chunks.append(current.strip())
+                    current = sentence
+                else:
+                    for i in range(0, len(sentence), max_chars):
+                        chunks.append(sentence[i:i + max_chars].strip())
+                    current = ""
             else:
-                for i in range(0, len(paragraph), max_chars):
-                    chunks.append(paragraph[i:i + max_chars])
-                current = ""
-        else:
-            current = candidate
+                current = candidate
 
     if current:
         chunks.append(current.strip())
@@ -82,25 +85,127 @@ def split_text(text: str, max_chars: int = MAX_CHARS):
     return chunks
 
 
-def generate_audio_chunk_with_elevenlabs(text: str, meta: dict, output_file: Path):
+def context_before(chunks, index: int, chars: int):
+    if index <= 0:
+        return None
+
+    text = " ".join(chunks[:index])
+    return text[-chars:] if text else None
+
+
+def context_after(chunks, index: int, chars: int):
+    if index >= len(chunks) - 1:
+        return None
+
+    text = " ".join(chunks[index + 1:])
+    return text[:chars] if text else None
+
+
+def run_ffmpeg(args):
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", *args],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg failed with exit code {e.returncode}") from e
+
+
+def normalize_chunk_to_wav(
+    input_file: Path,
+    output_file: Path,
+    target_lufs: float,
+    true_peak: float,
+    lra: float,
+):
+    run_ffmpeg([
+        "-i", str(input_file),
+        "-af", f"loudnorm=I={target_lufs}:TP={true_peak}:LRA={lra}",
+        "-ar", "44100",
+        "-ac", "2",
+        str(output_file),
+    ])
+
+
+def concatenate_wav_files(wav_files, output_wav: Path):
+    if not wav_files:
+        raise RuntimeError("No WAV chunks to concatenate")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        concat_file = Path(tmpdir) / "concat.txt"
+
+        concat_file.write_text(
+            "\n".join(f"file '{file.resolve()}'" for file in wav_files),
+            encoding="utf-8",
+        )
+
+        run_ffmpeg([
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_file),
+            "-c", "copy",
+            str(output_wav),
+        ])
+
+
+def export_final_mp3(
+    input_wav: Path,
+    output_mp3: Path,
+    target_lufs: float,
+    true_peak: float,
+    lra: float,
+    bitrate: str,
+):
+    run_ffmpeg([
+        "-i", str(input_wav),
+        "-af", f"loudnorm=I={target_lufs}:TP={true_peak}:LRA={lra}",
+        "-acodec", "libmp3lame",
+        "-b:a", bitrate,
+        "-ar", "44100",
+        "-ac", "2",
+        str(output_mp3),
+    ])
+
+
+def generate_audio_chunk_with_elevenlabs(
+    text: str,
+    meta: dict,
+    output_file: Path,
+    previous_text: str | None = None,
+    next_text: str | None = None,
+):
     api_key = os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
         raise RuntimeError("Missing ELEVENLABS_API_KEY environment variable")
 
     tts = meta.get("tts", {})
 
+    provider = tts.get("provider", "elevenlabs")
+    if provider != "elevenlabs":
+        raise RuntimeError(f"Unsupported TTS provider: {provider}")
+
     voice_id = tts.get("voice_id") or tts.get("voice")
     if not voice_id:
-        raise RuntimeError("Missing tts.voice or tts.voice_id in storyboard.md")
+        raise RuntimeError("Missing tts.voice_id in storyboard.md")
 
     model_id = tts.get("model_id", "eleven_multilingual_v2")
     voice_settings = tts.get("voice_settings", {})
+    seed = tts.get("seed")
 
     payload = {
         "text": text,
         "model_id": model_id,
         "voice_settings": voice_settings,
     }
+
+    if seed is not None:
+        payload["seed"] = seed
+
+    if previous_text:
+        payload["previous_text"] = previous_text
+
+    if next_text:
+        payload["next_text"] = next_text
 
     url = (
         f"https://api.elevenlabs.io/v1/text-to-speech/"
@@ -114,7 +219,7 @@ def generate_audio_chunk_with_elevenlabs(text: str, meta: dict, output_file: Pat
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=120,
+        timeout=180,
     )
 
     if response.status_code >= 400:
@@ -128,64 +233,86 @@ def generate_audio_chunk_with_elevenlabs(text: str, meta: dict, output_file: Pat
     output_file.write_bytes(response.content)
 
 
-def concatenate_mp3_files(chunk_files, output_file: Path):
-    """
-    Safe MP3 concatenation using re-encoding.
-    """
-
-    if not chunk_files:
-        raise RuntimeError("No audio chunks to concatenate")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        concat_file = tmpdir / "concat.txt"
-
-        concat_file.write_text(
-            "\n".join(f"file '{file.resolve()}'" for file in chunk_files),
-            encoding="utf-8",
-        )
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_file),
-                "-acodec", "libmp3lame",
-                "-b:a", "128k",
-                "-ar", "44100",
-                "-ac", "2",
-                str(output_file),
-            ],
-            check=True,
-        )
-
-
 def clean_old_chunks(chunks_dir: Path):
     if not chunks_dir.exists():
         return
 
-    for file in chunks_dir.glob("chunk_*.mp3"):
-        file.unlink()
-
-    for file in chunks_dir.glob("chunk_*.txt"):
-        file.unlink()
+    for pattern in (
+        "chunk_*.mp3",
+        "chunk_*.txt",
+    ):
+        for file in chunks_dir.glob(pattern):
+            file.unlink()
 
 
 def collect_existing_chunks(chunks_dir: Path):
     chunk_files = sorted(chunks_dir.glob("chunk_*.mp3"))
 
     if not chunk_files:
-        raise RuntimeError(
-            f"No existing chunk files found in: {chunks_dir}"
-        )
+        raise RuntimeError(f"No existing chunk files found in: {chunks_dir}")
 
     for chunk in chunk_files:
         if chunk.stat().st_size == 0:
             raise RuntimeError(f"Chunk file is empty: {chunk}")
 
     return chunk_files
+
+
+def build_final_audio_from_chunks(
+    chunk_files,
+    output_file: Path,
+    target_lufs: float,
+    true_peak: float,
+    lra: float,
+    bitrate: str,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        normalized_wavs = []
+
+        for index, chunk_file in enumerate(chunk_files, start=1):
+            wav_file = tmpdir / f"chunk_{index:03d}.normalized.wav"
+
+            print(f"Normalizing chunk {index}/{len(chunk_files)}")
+
+            normalize_chunk_to_wav(
+                input_file=chunk_file,
+                output_file=wav_file,
+                target_lufs=target_lufs,
+                true_peak=true_peak,
+                lra=lra,
+            )
+
+            normalized_wavs.append(wav_file)
+
+        full_wav = tmpdir / "narration.full.wav"
+
+        concatenate_wav_files(normalized_wavs, full_wav)
+
+        export_final_mp3(
+            input_wav=full_wav,
+            output_mp3=output_file,
+            target_lufs=target_lufs,
+            true_peak=true_peak,
+            lra=lra,
+            bitrate=bitrate,
+        )
+
+
+def get_tts_config(meta: dict):
+    tts = meta.get("tts", {})
+    chunking = tts.get("chunking", {})
+    post = tts.get("post_processing", {})
+
+    return {
+        "max_chars": int(chunking.get("max_chars", 9000)),
+        "context_chars": int(chunking.get("context_chars", 1200)),
+        "target_lufs": float(post.get("target_lufs", -16)),
+        "true_peak": float(post.get("true_peak", -1.5)),
+        "lra": float(post.get("lra", 11)),
+        "bitrate": str(post.get("bitrate", "192k")),
+    }
 
 
 def generate_audio_with_elevenlabs(
@@ -195,52 +322,71 @@ def generate_audio_with_elevenlabs(
     chunks_dir: Path,
     reuse_chunks: bool = False,
 ):
-    chunks = split_text(text)
+    config = get_tts_config(meta)
+
+    chunks = split_text(
+        text,
+        max_chars=config["max_chars"],
+    )
 
     print(f"Characters: {len(text)}")
     print(f"Chunks:     {len(chunks)}")
+    print(f"Max chars:  {config['max_chars']}")
+    print(f"Context:    {config['context_chars']} chars")
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     if reuse_chunks:
         print("Reusing existing chunks...")
         chunk_files = collect_existing_chunks(chunks_dir)
-
         print(f"Found {len(chunk_files)} existing chunks")
-
-        concatenate_mp3_files(chunk_files, output_file)
-        return
-
-    clean_old_chunks(chunks_dir)
-
-    chunk_files = []
-
-    for index, chunk in enumerate(chunks, start=1):
-        chunk_file = chunks_dir / f"chunk_{index:03d}.mp3"
-        chunk_text_file = chunks_dir / f"chunk_{index:03d}.txt"
-
-        print(
-            f"Generating chunk {index}/{len(chunks)} "
-            f"({len(chunk)} characters)"
-        )
-
-        chunk_text_file.write_text(chunk, encoding="utf-8")
-
-        generate_audio_chunk_with_elevenlabs(
-            chunk,
-            meta,
-            chunk_file,
-        )
-
-        if not chunk_file.exists() or chunk_file.stat().st_size == 0:
-            raise RuntimeError(f"Generated chunk is missing or empty: {chunk_file}")
-
-        chunk_files.append(chunk_file)
-
-    if len(chunk_files) == 1:
-        output_file.write_bytes(chunk_files[0].read_bytes())
     else:
-        concatenate_mp3_files(chunk_files, output_file)
+        clean_old_chunks(chunks_dir)
+
+        chunk_files = []
+
+        for index, chunk in enumerate(chunks):
+            chunk_number = index + 1
+
+            chunk_file = chunks_dir / f"chunk_{chunk_number:03d}.mp3"
+            chunk_text_file = chunks_dir / f"chunk_{chunk_number:03d}.txt"
+
+            print(
+                f"Generating chunk {chunk_number}/{len(chunks)} "
+                f"({len(chunk)} characters)"
+            )
+
+            chunk_text_file.write_text(chunk, encoding="utf-8")
+
+            generate_audio_chunk_with_elevenlabs(
+                text=chunk,
+                meta=meta,
+                output_file=chunk_file,
+                previous_text=context_before(
+                    chunks,
+                    index,
+                    chars=config["context_chars"],
+                ),
+                next_text=context_after(
+                    chunks,
+                    index,
+                    chars=config["context_chars"],
+                ),
+            )
+
+            if not chunk_file.exists() or chunk_file.stat().st_size == 0:
+                raise RuntimeError(f"Generated chunk is missing or empty: {chunk_file}")
+
+            chunk_files.append(chunk_file)
+
+    build_final_audio_from_chunks(
+        chunk_files=chunk_files,
+        output_file=output_file,
+        target_lufs=config["target_lufs"],
+        true_peak=config["true_peak"],
+        lra=config["lra"],
+        bitrate=config["bitrate"],
+    )
 
     if not output_file.exists() or output_file.stat().st_size == 0:
         raise RuntimeError(f"Final narration file is missing or empty: {output_file}")
@@ -253,13 +399,13 @@ def main():
 
     parser.add_argument(
         "directory",
-        help="Directory containing storyboard.md"
+        help="Directory containing storyboard.md",
     )
 
     parser.add_argument(
         "--reuse-chunks",
         action="store_true",
-        help="Reuse existing chunk mp3 files instead of regenerating them"
+        help="Reuse existing chunk mp3 files instead of regenerating them",
     )
 
     args = parser.parse_args()
@@ -286,10 +432,10 @@ def main():
     txt_file.write_text(narration, encoding="utf-8")
 
     generate_audio_with_elevenlabs(
-        narration,
-        meta,
-        mp3_file,
-        chunks_dir,
+        text=narration,
+        meta=meta,
+        output_file=mp3_file,
+        chunks_dir=chunks_dir,
         reuse_chunks=args.reuse_chunks,
     )
 
