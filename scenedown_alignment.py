@@ -202,28 +202,77 @@ def char_time_at(chars, index: int, prefer_end: bool = False):
 
 
 def normalize_with_index_map(text: str):
+    """
+    Normalize text for robust matching while keeping a map back to the
+    original character positions.
+
+    This intentionally ignores punctuation/case differences and works with
+    Hungarian accented characters. The previous version required almost exact
+    string equality, so a changed comma, dash, quote, or small edit in
+    narration.txt could make the whole alignment fail at a scene boundary.
+    """
     normalized = []
     index_map = []
+    in_space = True
 
-    i = 0
-    in_space = False
-
-    while i < len(text):
-        ch = text[i]
-
-        if ch.isspace():
+    for i, ch in enumerate(text):
+        if ch.isalnum():
+            normalized.append(ch.casefold())
+            index_map.append(i)
+            in_space = False
+        else:
             if not in_space:
                 normalized.append(" ")
                 index_map.append(i)
                 in_space = True
-        else:
-            normalized.append(ch)
-            index_map.append(i)
-            in_space = False
 
-        i += 1
+    # Drop leading/trailing normalized spaces together with their map entries.
+    while normalized and normalized[0] == " ":
+        normalized.pop(0)
+        index_map.pop(0)
 
-    return "".join(normalized).strip(), index_map
+    while normalized and normalized[-1] == " ":
+        normalized.pop()
+        index_map.pop()
+
+    return "".join(normalized), index_map
+
+
+def _find_best_anchor(normalized_transcript: str, normalized_scene: str, cursor: int):
+    """
+    Fallback for scenes that are not an exact match.
+
+    It searches for a reasonably long prefix and suffix from the scene text.
+    This handles the common case where narration.txt was generated from a
+    slightly older/newer storyboard: the scene may contain a sentence-level edit,
+    but its beginning and end are still present.
+    """
+    words = normalized_scene.split()
+    if len(words) < 8:
+        return None
+
+    # Try increasingly shorter anchors. Keep these word-based so Hungarian
+    # punctuation and line breaks do not matter.
+    max_anchor = min(18, max(8, len(words) // 3))
+    min_anchor = 5
+
+    for anchor_len in range(max_anchor, min_anchor - 1, -1):
+        prefix = " ".join(words[:anchor_len])
+        suffix = " ".join(words[-anchor_len:])
+
+        start = normalized_transcript.find(prefix, cursor)
+        if start == -1:
+            continue
+
+        suffix_start_min = start + len(prefix)
+        suffix_pos = normalized_transcript.find(suffix, suffix_start_min)
+        if suffix_pos == -1:
+            continue
+
+        end = suffix_pos + len(suffix) - 1
+        return start, end, anchor_len
+
+    return None
 
 
 def find_scene_positions_in_transcript(scenes, transcript: str):
@@ -242,13 +291,36 @@ def find_scene_positions_in_transcript(scenes, transcript: str):
 
         start_norm = normalized_transcript.find(normalized_scene, cursor)
 
-        if start_norm == -1:
-            raise RuntimeError(
-                f"Could not find scene text in narration transcript: "
-                f"{scene['title']}"
+        if start_norm != -1:
+            end_norm = start_norm + len(normalized_scene) - 1
+            match_mode = "exact"
+        else:
+            fallback = _find_best_anchor(
+                normalized_transcript,
+                normalized_scene,
+                cursor,
             )
 
-        end_norm = start_norm + len(normalized_scene) - 1
+            if not fallback:
+                context_start = max(0, cursor - 300)
+                context_end = min(len(normalized_transcript), cursor + 900)
+                context = normalized_transcript[context_start:context_end]
+                raise RuntimeError(
+                    f"Could not find scene text in narration transcript: "
+                    f"{scene['title']}\n"
+                    f"This usually means generated/audio/narration.txt was "
+                    f"created from a different storyboard.md. Regenerate "
+                    f"narration.txt/audio, or inspect this normalized transcript "
+                    f"area near the failure:\n{context}"
+                )
+
+            start_norm, end_norm, anchor_len = fallback
+            match_mode = f"anchor:{anchor_len}w"
+            print(
+                f"Warning: scene '{scene['title']}' was matched by anchors "
+                f"instead of exact text. Check whether narration.txt and "
+                f"storyboard.md differ."
+            )
 
         start_char = transcript_map[start_norm]
         end_char = transcript_map[end_norm] + 1
@@ -257,6 +329,7 @@ def find_scene_positions_in_transcript(scenes, transcript: str):
             "scene": scene,
             "start_char": start_char,
             "end_char": end_char,
+            "match_mode": match_mode,
         })
 
         cursor = end_norm + 1
@@ -293,6 +366,7 @@ def align_scenes_to_characters(scenes, transcript: str, alignment_data):
             "text": scene["text"],
             "start_char": start_char,
             "end_char": end_char,
+            "match_mode": item.get("match_mode", "exact"),
         })
 
     return result
