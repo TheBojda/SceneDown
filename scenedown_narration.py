@@ -201,11 +201,17 @@ def generate_audio_chunk_with_elevenlabs(
     if seed is not None:
         payload["seed"] = seed
 
-    if previous_text:
-        payload["previous_text"] = previous_text
+    supports_context = model_id not in {
+        "eleven_v3",
+    }
 
-    if next_text:
-        payload["next_text"] = next_text
+    if supports_context:
+
+        if previous_text:
+            payload["previous_text"] = previous_text
+
+        if next_text:
+            payload["next_text"] = next_text
 
     url = (
         f"https://api.elevenlabs.io/v1/text-to-speech/"
