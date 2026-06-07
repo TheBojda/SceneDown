@@ -25,6 +25,26 @@ def ffprobe_duration(file: Path) -> float:
     return float(result.decode().strip())
 
 
+
+def has_audio_stream(file: Path) -> bool:
+    result = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        str(file),
+    ], capture_output=True, text=True, check=True)
+    return bool(result.stdout.strip())
+
+
+def assert_audio_stream(file: Path):
+    if not has_audio_stream(file):
+        raise RuntimeError(f"Generated file has no audio stream: {file}")
+
+def scene_audio_file(base_dir: Path, scene_number: int) -> Path:
+    return base_dir / "generated" / "audio" / "scenes" / f"scene_{scene_number:03d}.mp3"
+
+
 def split_frontmatter(md: str):
     if md.startswith("---"):
         parts = md.split("---", 2)
@@ -198,7 +218,17 @@ def main():
     parser.add_argument(
         "--scene",
         type=int,
-        help="Render only a single scene number, 1-based. Useful for debugging."
+        help="Render only a single scene number, 1-based. By default this creates a silent debug clip."
+    )
+    parser.add_argument(
+        "--with-scene-audio",
+        action="store_true",
+        help="When used with --scene, attach generated/audio/scenes/scene_XXX.mp3 and output a standalone scene video."
+    )
+    parser.add_argument(
+        "--scene-video",
+        type=int,
+        help="Render one scene as a standalone video with its scene audio. Equivalent to --scene N --with-scene-audio."
     )
     parser.add_argument(
         "--reuse-clips",
@@ -207,6 +237,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.scene_video is not None:
+        if args.scene is not None and args.scene != args.scene_video:
+            raise RuntimeError("Use either --scene or --scene-video, not both with different values")
+        args.scene = args.scene_video
+        args.with_scene_audio = True
 
     base_dir = Path(args.directory).resolve()
 
@@ -218,13 +254,20 @@ def main():
     meta, body = split_frontmatter(md)
 
     storyboard_scenes = parse_scene_images(body)
-    aligned_scenes = json.loads(scenes_file.read_text(encoding="utf-8"))
 
-    if len(storyboard_scenes) != len(aligned_scenes):
-        raise RuntimeError(
-            f"Scene count mismatch: storyboard has {len(storyboard_scenes)}, "
-            f"alignment has {len(aligned_scenes)}"
-        )
+    aligned_scenes = None
+    full_audio_duration = None
+
+    if not (args.scene is not None and args.with_scene_audio):
+        aligned_scenes = json.loads(scenes_file.read_text(encoding="utf-8"))
+
+        if len(storyboard_scenes) != len(aligned_scenes):
+            raise RuntimeError(
+                f"Scene count mismatch: storyboard has {len(storyboard_scenes)}, "
+                f"alignment has {len(aligned_scenes)}"
+            )
+
+        full_audio_duration = ffprobe_duration(audio_file)
 
     if args.scene is not None:
         if args.scene < 1 or args.scene > len(storyboard_scenes):
@@ -237,8 +280,6 @@ def main():
     width = int(video_meta.get("width", 1920))
     height = int(video_meta.get("height", 1080))
     fps = int(video_meta.get("fps", 30))
-
-    audio_duration = ffprobe_duration(audio_file)
 
     output_dir = base_dir / "generated" / "video"
     clips_dir = output_dir / "clips"
@@ -265,21 +306,30 @@ def main():
         if not image_file.exists():
             raise FileNotFoundError(image_file)
 
-        start = float(aligned_scenes[i]["start"])
-
-        if i + 1 < len(aligned_scenes):
-            end = float(aligned_scenes[i + 1]["start"])
+        if args.scene is not None and args.with_scene_audio:
+            scene_audio = scene_audio_file(base_dir, scene_number)
+            if not scene_audio.exists():
+                raise FileNotFoundError(
+                    f"Missing scene audio: {scene_audio}\n"
+                    f"Generate it first with the narration script."
+                )
+            real_duration = max(0.1, ffprobe_duration(scene_audio))
         else:
-            end = audio_duration
+            start = float(aligned_scenes[i]["start"])
 
-        real_duration = max(0.1, end - start)
+            if i + 1 < len(aligned_scenes):
+                end = float(aligned_scenes[i + 1]["start"])
+            else:
+                end = full_audio_duration
+
+            real_duration = max(0.1, end - start)
 
         transition = scene.get("transition", "fade")
         is_last_scene = i == len(storyboard_scenes) - 1
 
         render_duration = real_duration
 
-        if transition != "cut" and not is_last_scene:
+        if transition != "cut" and not is_last_scene and not (args.scene is not None and args.with_scene_audio):
             render_duration += fade_duration
 
         clip_durations.append(render_duration)
@@ -331,6 +381,39 @@ def main():
         raise RuntimeError("No clips were generated")
 
     if args.scene is not None:
+        if args.with_scene_audio:
+            scenes_output_dir = output_dir / "scenes"
+            scenes_output_dir.mkdir(parents=True, exist_ok=True)
+
+            scene_audio = scene_audio_file(base_dir, args.scene)
+            final_video = scenes_output_dir / f"scene_{args.scene:03}.mp4"
+
+            if not has_audio_stream(scene_audio):
+                raise RuntimeError(f"Scene audio file has no audio stream: {scene_audio}")
+
+            run([
+                "ffmpeg", "-y",
+                "-i", str(clip_files[0]),
+                "-i", str(scene_audio),
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-shortest",
+                str(final_video),
+            ])
+
+            assert_audio_stream(final_video)
+            final_duration = ffprobe_duration(final_video)
+
+            print(f"Generated scene video: {final_video}")
+            print(f"Scene number: {args.scene}")
+            print(f"Scene audio:  {scene_audio}")
+            print(f"Scene duration: {final_duration:.2f}s")
+            return
+
         final_video = output_dir / f"scene_debug_{args.scene:03}.mp4"
 
         run([
@@ -356,21 +439,29 @@ def main():
         fps=fps,
     )
 
+    if not has_audio_stream(audio_file):
+        raise RuntimeError(f"Narration audio file has no audio stream: {audio_file}")
+
     run([
         "ffmpeg", "-y",
         "-i", str(silent_video),
         "-i", str(audio_file),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
         "-shortest",
         str(final_video),
     ])
 
+    assert_audio_stream(final_video)
     silent_duration = ffprobe_duration(silent_video)
     final_duration = ffprobe_duration(final_video)
 
     print(f"Generated video: {final_video}")
-    print(f"Audio duration:  {audio_duration:.2f}s")
+    print(f"Audio duration:  {full_audio_duration:.2f}s")
     print(f"Silent duration: {silent_duration:.2f}s")
     print(f"Final duration:  {final_duration:.2f}s")
 
