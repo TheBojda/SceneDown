@@ -20,6 +20,15 @@ class SceneNarration:
     text: str
 
 
+@dataclass
+class NarrationChunk:
+    number: int
+    first_scene_number: int
+    last_scene_number: int
+    title: str
+    text: str
+
+
 def split_frontmatter(md: str):
     if md.startswith("---"):
         parts = md.split("---", 2)
@@ -303,6 +312,104 @@ def scene_txt_path(scenes_dir: Path, scene_number: int):
     return scenes_dir / f"scene_{scene_number:03d}.txt"
 
 
+def clean_old_chunks(chunks_dir: Path):
+    if not chunks_dir.exists():
+        return
+
+    for pattern in ("chunk_*.mp3", "chunk_*.txt"):
+        for file in chunks_dir.glob(pattern):
+            file.unlink()
+
+
+def chunk_mp3_path(chunks_dir: Path, chunk_number: int):
+    return chunks_dir / f"chunk_{chunk_number:03d}.mp3"
+
+
+def chunk_txt_path(chunks_dir: Path, chunk_number: int):
+    return chunks_dir / f"chunk_{chunk_number:03d}.txt"
+
+
+def build_narration_chunks(scenes, max_chars: int):
+    if max_chars <= 0:
+        raise RuntimeError("tts.max_chunk_chars must be greater than 0")
+
+    chunks = []
+    current_scenes = []
+    current_len = 0
+
+    def scene_text_for_chunk(scene):
+        return scene.text.strip()
+
+    def flush_chunk():
+        nonlocal current_scenes, current_len
+
+        if not current_scenes:
+            return
+
+        first_scene = current_scenes[0]
+        last_scene = current_scenes[-1]
+        text = "\n\n".join(scene_text_for_chunk(scene) for scene in current_scenes).strip() + "\n"
+
+        if first_scene.number == last_scene.number:
+            title = first_scene.title
+        else:
+            title = f"{first_scene.title} → {last_scene.title}"
+
+        chunks.append(
+            NarrationChunk(
+                number=len(chunks) + 1,
+                first_scene_number=first_scene.number,
+                last_scene_number=last_scene.number,
+                title=title,
+                text=text,
+            )
+        )
+
+        current_scenes = []
+        current_len = 0
+
+    for scene in scenes:
+        text = scene_text_for_chunk(scene)
+        if not text:
+            continue
+
+        scene_len = len(text)
+        separator_len = 2 if current_scenes else 0
+
+        if current_scenes and current_len + separator_len + scene_len > max_chars:
+            flush_chunk()
+            separator_len = 0
+
+        if scene_len > max_chars:
+            raise RuntimeError(
+                f"Scene {scene.number} is {scene_len} characters, which exceeds "
+                f"tts.max_chunk_chars={max_chars}. Split this scene into smaller scenes."
+            )
+
+        current_scenes.append(scene)
+        current_len += separator_len + scene_len
+
+    flush_chunk()
+    return chunks
+
+
+def collect_chunk_audio_files(chunks_dir: Path, chunks):
+    chunk_files = []
+
+    for chunk in chunks:
+        chunk_file = chunk_mp3_path(chunks_dir, chunk.number)
+
+        if not chunk_file.exists():
+            raise RuntimeError(f"Missing chunk audio: {chunk_file}")
+
+        if chunk_file.stat().st_size == 0:
+            raise RuntimeError(f"Chunk audio file is empty: {chunk_file}")
+
+        chunk_files.append(chunk_file)
+
+    return chunk_files
+
+
 def collect_scene_audio_files(scenes_dir: Path, scenes):
     scene_files = []
 
@@ -361,11 +468,80 @@ def get_tts_config(meta: dict):
         "context_chars": int(tts.get("context_chars", consistency.get("context_chars", 3000))),
         "context_scenes_before": int(tts.get("context_scenes_before", consistency.get("context_scenes_before", 2))),
         "context_scenes_after": int(tts.get("context_scenes_after", consistency.get("context_scenes_after", 2))),
+        "max_chunk_chars": int(tts.get("max_chunk_chars", 5000)),
         "target_lufs": float(post.get("target_lufs", -16)),
         "true_peak": float(post.get("true_peak", -1.5)),
         "lra": float(post.get("lra", 11)),
         "bitrate": str(post.get("bitrate", "192k")),
     }
+
+
+def generate_chunk_audio(scenes, meta: dict, output_file: Path, chunks_dir: Path):
+    config = get_tts_config(meta)
+    effective_meta = get_effective_meta(meta)
+    voice_settings = effective_meta.get("tts", {}).get("voice_settings", {})
+    chunks = build_narration_chunks(scenes, config["max_chunk_chars"])
+
+    print(f"Scenes:      {len(scenes)}")
+    print(f"Chunks:      {len(chunks)}")
+    print(f"Characters:  {sum(len(scene.text) for scene in scenes)}")
+    print(f"Chunk limit: {config['max_chunk_chars']} chars")
+    print(f"Context:     {config['context_chars']} chars")
+    print(f"Voice settings: {voice_settings}")
+
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    clean_old_chunks(chunks_dir)
+
+    for index, chunk in enumerate(chunks):
+        chunk_file = chunk_mp3_path(chunks_dir, chunk.number)
+        chunk_text_file = chunk_txt_path(chunks_dir, chunk.number)
+
+        previous_text = context_before(
+            scenes,
+            chunk.first_scene_number - 1,
+            chars=config["context_chars"],
+            scene_count=config["context_scenes_before"],
+        )
+        next_text = context_after(
+            scenes,
+            chunk.last_scene_number - 1,
+            chars=config["context_chars"],
+            scene_count=config["context_scenes_after"],
+        )
+
+        print(
+            f"Generating chunk {chunk.number}/{len(chunks)}: "
+            f"scenes {chunk.first_scene_number}-{chunk.last_scene_number} "
+            f"({len(chunk.text)} characters, "
+            f"prev_context={len(previous_text or '')}, next_context={len(next_text or '')})"
+        )
+
+        chunk_text_file.write_text(chunk.text, encoding="utf-8")
+
+        generate_audio_with_elevenlabs(
+            text=chunk.text,
+            meta=effective_meta,
+            output_file=chunk_file,
+            previous_text=previous_text,
+            next_text=next_text,
+        )
+
+        if not chunk_file.exists() or chunk_file.stat().st_size == 0:
+            raise RuntimeError(f"Generated chunk audio is missing or empty: {chunk_file}")
+
+    chunk_files = collect_chunk_audio_files(chunks_dir, chunks)
+
+    build_final_audio_from_scenes(
+        scene_files=chunk_files,
+        output_file=output_file,
+        target_lufs=config["target_lufs"],
+        true_peak=config["true_peak"],
+        lra=config["lra"],
+        bitrate=config["bitrate"],
+    )
+
+    if not output_file.exists() or output_file.stat().st_size == 0:
+        raise RuntimeError(f"Final narration file is missing or empty: {output_file}")
 
 
 def generate_scene_audio(scenes, meta: dict, output_file: Path, scenes_dir: Path, reuse_scenes: bool = False, regen_scene: int | None = None):
@@ -376,6 +552,7 @@ def generate_scene_audio(scenes, meta: dict, output_file: Path, scenes_dir: Path
     print(f"Scenes:      {len(scenes)}")
     print(f"Characters:  {sum(len(scene.text) for scene in scenes)}")
     print(f"Context:     {config['context_chars']} chars")
+    print(f"Chunk limit: {config['max_chunk_chars']} chars")
     print(f"Prev scenes: {config['context_scenes_before']}")
     print(f"Next scenes: {config['context_scenes_after']}")
     print(f"Voice settings: {voice_settings}")
@@ -457,6 +634,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate scene-based ElevenLabs narration audio from storyboard.md")
 
     parser.add_argument("directory", help="Directory containing storyboard.md")
+    parser.add_argument("--scene-mode", action="store_true", help="Generate every scene as a separate mp3 instead of chunking scenes")
     parser.add_argument("--reuse-scenes", action="store_true", help="Reuse existing scene mp3 files instead of regenerating them")
     parser.add_argument("--regen-scene", type=int, help="Regenerate only the selected 1-based scene number, then rebuild narration.mp3")
 
@@ -481,23 +659,33 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     scenes_dir = output_dir / "scenes"
+    chunks_dir = output_dir / "chunks"
     txt_file = output_dir / "narration.txt"
     mp3_file = output_dir / "narration.mp3"
 
     txt_file.write_text(narration, encoding="utf-8")
 
-    generate_scene_audio(
-        scenes=scenes,
-        meta=meta,
-        output_file=mp3_file,
-        scenes_dir=scenes_dir,
-        reuse_scenes=args.reuse_scenes,
-        regen_scene=args.regen_scene,
-    )
+    if args.scene_mode or args.reuse_scenes or args.regen_scene is not None:
+        generate_scene_audio(
+            scenes=scenes,
+            meta=meta,
+            output_file=mp3_file,
+            scenes_dir=scenes_dir,
+            reuse_scenes=args.reuse_scenes,
+            regen_scene=args.regen_scene,
+        )
+    else:
+        generate_chunk_audio(
+            scenes=scenes,
+            meta=meta,
+            output_file=mp3_file,
+            chunks_dir=chunks_dir,
+        )
 
     print(f"Generated text:    {txt_file}")
     print(f"Generated audio:   {mp3_file}")
     print(f"Generated scenes:  {scenes_dir}")
+    print(f"Generated chunks:  {chunks_dir}")
 
 
 if __name__ == "__main__":
